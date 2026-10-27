@@ -215,6 +215,67 @@ def estimate_ground_offset(means, counts, traj_xy, traj_z, near_radius=1.5,
     return offset, hist_info
 
 
+def visibility_counts(frames, traj, uniq_keys, resolution, step, max_range, stride):
+    """帧内射线穿透投票（DUFOMap 核心判据的轻量实现）。
+
+    对每帧的每个点，从该帧位姿沿射线按 step 采样，落在已占用体素上的采样点
+    记一次"穿透"。同时被大量命中、又被大量穿透的体素 = 动态物（人先被看到、
+    离开后又被扫穿）。
+
+    返回与 uniq_keys 对齐的穿透计数。
+    """
+    counts = np.zeros(len(uniq_keys), dtype=np.int64)
+    if len(frames) == 0 or len(uniq_keys) == 0:
+        return counts
+    keys_sorted = uniq_keys
+    traj_t = traj[:, 0]
+    # 必须与 voxel_keys() 用同一套编码，否则 searchsorted 永远对不上
+    span = 20000
+    side = 40001
+
+    usable = 0
+    for index in range(0, len(frames), stride):
+        stamp, xyz = frames[index]
+        if len(xyz) == 0:
+            continue
+        pos = int(np.clip(np.searchsorted(traj_t, stamp), 1, len(traj_t) - 1))
+        # 取时间上更近的一帧位姿
+        if abs(traj_t[pos - 1] - stamp) < abs(traj_t[pos] - stamp):
+            pos -= 1
+        origin = traj[pos, 1:4]
+        d = xyz[:, :3].astype(np.float64) - origin
+        length = np.linalg.norm(d, axis=1)
+        keep = (length > 0.5) & (length <= max_range)
+        if not keep.any():
+            continue
+        d = d[keep]
+        length = length[keep]
+        steps = np.maximum(1, np.ceil(length / step).astype(np.int64))
+        total = int(steps.sum())
+        if total == 0:
+            continue
+        ray = np.repeat(np.arange(len(length), dtype=np.int64), steps)
+        starts = np.repeat(np.cumsum(steps) - steps, steps)
+        dist = ((np.arange(total, dtype=np.float64) - starts) + 0.5) * step
+        unit = d[ray] / length[ray][:, None] * dist[:, None]
+        samples = origin + unit
+        # 跳过紧邻位姿与终点附近，避免把自身和命中面记成穿透
+        inside_range = (dist > 0.5) & (dist < (length[ray] - 2.0 * step))
+        if not inside_range.any():
+            continue
+        samples = samples[inside_range]
+        grid = np.floor(samples / resolution).astype(np.int64) + span
+        keys = (grid[:, 0] * side + grid[:, 1]) * side + grid[:, 2]
+        idx = np.searchsorted(keys_sorted, keys)
+        idx = np.clip(idx, 0, len(keys_sorted) - 1)
+        hit = keys_sorted[idx] == keys
+        if not hit.any():
+            continue
+        counts += np.bincount(idx[hit], minlength=len(keys_sorted)).astype(np.int64)
+        usable += 1
+    return counts
+
+
 def otsu_threshold(values, lo=2, hi=40):
     """对帧数做两类分割，返回阈值（保留 count >= 阈值）。"""
     if len(values) == 0:
@@ -261,6 +322,16 @@ def main():
                         help="保留被 >=N 帧观测到的体素；0=自动（Otsu，钳制 2~20）")
     parser.add_argument("--ground-offset", type=float, default=None,
                         help="雷达光心到地面高度；省略则自动估计")
+    parser.add_argument("--visibility-filter", action="store_true",
+                        help="启用射线穿透投票（DUFOMap 轻量实现），与帧计数联合判定动态点")
+    parser.add_argument("--visibility-step", type=float, default=0.10,
+                        help="射线采样间隔（m）")
+    parser.add_argument("--visibility-max-range", type=float, default=8.0,
+                        help="参与投票的射线最大长度（m）")
+    parser.add_argument("--visibility-stride", type=int, default=2,
+                        help="每隔几帧做一次投票（越大越快越粗）")
+    parser.add_argument("--visibility-ratio", type=float, default=0.5,
+                        help="穿透占比超过该值判为动态（0~1）")
     parser.add_argument("--remove-ground", action="store_true",
                         help="额外输出 cloud_noground.pcd（按当地地面去掉地面及以下的点）")
     parser.add_argument("--ground-remove-height-m", type=float, default=0.10,
@@ -277,6 +348,7 @@ def main():
                           [t for t, _ in conns.values()] else None)
 
     odom = []
+    frame_clouds = []            # [(stamp, xyz)] 供可见性投票
     voxel_all_keys, voxel_all_rep = [], []
     frames = 0
     frames_used = 0
@@ -303,6 +375,8 @@ def main():
                     cloud_frame_name = cloud_frame_name or name
                     if len(xyz) == 0:
                         continue
+                    if args.visibility_filter:
+                        frame_clouds.append((_stamp, xyz))
                     if args.max_points_per_frame:
                         xyz = xyz[:args.max_points_per_frame]
                     frames_used += 1
@@ -327,6 +401,13 @@ def main():
         means, counts, traj[:, 1:3], traj[:, 3]
     ) if args.ground_offset is None else (args.ground_offset, None)
 
+    visibility = None
+    if args.visibility_filter:
+        visibility = visibility_counts(
+            frame_clouds, traj, uniq_keys, args.voxel,
+            args.visibility_step, args.visibility_max_range, max(1, args.visibility_stride),
+        )
+
     if args.min_frames > 0:
         min_frames, threshold_mode = args.min_frames, "explicit"
     else:
@@ -346,7 +427,18 @@ def main():
 
     write_pcd(out / "cloud_voxel_all.pcd", means.astype(np.float32),
               np.clip(counts, 0, 255).astype(np.float32))
+    if visibility is not None:
+        np.save(out / "voxel_hit_counts.npy", counts)
+        np.save(out / "voxel_visibility_counts.npy", visibility)
+        np.save(out / "voxel_keys.npy", uniq_keys)
+
     keep = counts >= min_frames
+    if visibility is not None:
+        observed = counts.astype(np.float64)
+        crossed = visibility.astype(np.float64)
+        ratio = crossed / np.maximum(observed + crossed, 1.0)
+        dynamic = ratio >= args.visibility_ratio
+        keep = keep & ~dynamic
     write_pcd(out / "cloud_static.pcd", means[keep].astype(np.float32),
               np.clip(counts[keep], 0, 255).astype(np.float32))
 
