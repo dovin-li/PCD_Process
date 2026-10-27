@@ -139,6 +139,9 @@ def run():
             occupancy_radius_m=0.0, margin_m=0.1,
             chunk_points=2, max_grid_cells=10000, overwrite=False,
             auto_ground_offset=False,
+            raycast_free=True, raycast_skip_near_m=0.20,
+            raycast_min_support=3, raycast_support_radius_m=0.30,
+            raycast_source="ground",
         )
         with contextlib.redirect_stdout(io.StringIO()):
             metrics = process(args)
