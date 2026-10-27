@@ -12,6 +12,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -24,7 +25,9 @@ from urllib.parse import parse_qs, urlparse
 
 TOOLS = Path(__file__).resolve().parent
 REPO = TOOLS.parent
-PYTHON = "/usr/bin/python3"          # 带 numpy / scipy 的解释器
+# 需要 numpy + scipy 的解释器；可用 PCD_PYTHON 环境变量覆盖
+PYTHON = os.environ.get("PCD_PYTHON") or (
+    "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable)
 SERVED_SUFFIXES = {".pgm", ".png", ".pcd", ".yaml", ".json", ".md", ".tum"}
 
 JOBS = {}
