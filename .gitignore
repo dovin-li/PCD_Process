@@ -1,0 +1,15 @@
+# 处理产物（PCD / 地图 / 轨迹），不进仓库
+out/
+*.pcd
+*.pgm
+*.tum
+!tests/fixtures/*.pgm
+
+# Python
+__pycache__/
+*.pyc
+.venv*/
+.pytest_cache/
+
+# macOS
+.DS_Store
